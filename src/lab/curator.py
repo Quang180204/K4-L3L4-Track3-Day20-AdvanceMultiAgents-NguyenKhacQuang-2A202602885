@@ -55,6 +55,11 @@ def parse_skill_blocks(reply: str) -> list[tuple[str, str]]:
 # --------------------------------------------------------------------------------------------------
 
 
+import json
+from .model import make_model
+from .tasks import ROOT, eval_markers
+
+
 def curate_skills(results_dir="results", source_condition="baseline", out_dir=None, model=None, max_skills: int = 3) -> list[Path]:
     """Đọc các lần chạy của TÁC VỤ HỌC (role == "learn") trong `source_condition`, nhờ LLM viết skill, ghi file.
 
@@ -68,7 +73,106 @@ def curate_skills(results_dir="results", source_condition="baseline", out_dir=No
     model mặc định: make_model() (lab.model).
     Trả về: danh sách đường dẫn SKILL.md đã ghi.
     """
-    raise NotImplementedError("TODO: cài đặt curate_skills (xem guides/pseudocode/04_curator.md)")
+    results_dir = Path(results_dir)
+    if out_dir is None:
+        out_dir = ROOT / "skills" / "auto"
+    else:
+        out_dir = Path(out_dir)
+
+    runs = []
+    condition_dir = results_dir / source_condition
+    if condition_dir.exists():
+        for run_path in sorted(condition_dir.glob("*/run.json")):
+            try:
+                r = json.loads(run_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if r.get("role") != "learn":
+                continue
+            failed = []
+            for check in r.get("checks", []):
+                if not check.get("passed", False):
+                    failed.append((check.get("name", ""), check.get("detail", "")))
+            trace_path = run_path.parent / "trace.md"
+            trace = ""
+            if trace_path.exists():
+                try:
+                    trace = trace_path.read_text(encoding="utf-8")
+                    trace = trace[-6000:]
+                except Exception:
+                    pass
+            if failed:
+                runs.append({
+                    "task": r.get("task", run_path.parent.name),
+                    "failed": failed,
+                    "trace": trace,
+                })
+
+    if not runs or not any(run["failed"] for run in runs):
+        print("WARNING: không có check thất bại ở tác vụ học")
+        return []
+
+    if model is None:
+        model = make_model()
+
+    prompt_lines = [
+        "You write SKILLS for a programming and data analysis agent.",
+        "Below are the failed checks (check names and evaluation bot feedback/rules) and traces from recent runs.",
+        f"Find common procedural failure patterns and write up to {max_skills} concise skills to prevent them on new tasks of the same type.",
+        "",
+        "Rules:",
+        "- Skills must be general: do not mention task IDs, specific private file names, specific answers, or specific numbers.",
+        "- Each skill must have YAML frontmatter with `name` (lowercase, numbers, hyphens only, max 64 chars) and `description` (one sentence: when to use this skill, max 1024 chars).",
+        "- The body must be at most 40 lines of imperative guidance/checklist.",
+        "- Do NOT mention any evaluation markers.",
+        "- Exact block format:",
+        "=== SKILL: <name> ===",
+        "---",
+        "name: <name>",
+        "description: <when to use>",
+        "---",
+        "<content>",
+        "=== END ===",
+        "",
+    ]
+    for run in runs:
+        prompt_lines.append(f"--- TASK: {run['task']} ---")
+        prompt_lines.append("Failed checks:")
+        for name, detail in run["failed"]:
+            prompt_lines.append(f"- {name}: {detail}")
+        if run["trace"]:
+            prompt_lines.append(f"Recent trace excerpt:\n{run['trace']}\n")
+
+    prompt = "\n".join(prompt_lines)
+    reply = model.invoke(prompt)
+    raw_content = getattr(reply, "content", reply)
+    if isinstance(raw_content, list):
+        parts = []
+        for p in raw_content:
+            if isinstance(p, dict) and "text" in p:
+                parts.append(p["text"])
+            elif isinstance(p, str):
+                parts.append(p)
+            else:
+                parts.append(str(p))
+        content = "\n".join(parts)
+    else:
+        content = str(raw_content)
+
+    written: list[Path] = []
+    blocks = parse_skill_blocks(content)
+    for name, text in blocks:
+        if len(written) >= max_skills:
+            break
+        problems = validate_skill(text, expected_name=name)
+        if problems:
+            continue
+        skill_file = out_dir / name / "SKILL.md"
+        skill_file.parent.mkdir(parents=True, exist_ok=True)
+        skill_file.write_text(text, encoding="utf-8")
+        written.append(skill_file)
+
+    return written
 
 
 if __name__ == "__main__":
